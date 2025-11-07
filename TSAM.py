@@ -67,8 +67,12 @@ class TSAM(nn.Module):
         self.visual_token_embedding.requires_grad_(False)
         self.text_token_embedding.requires_grad_(False)
 
+        # 保留原始可用性掩码，便于编码与缺模态处理（True 表示缺失/不可用）
+        self.ent_vis_mask = ent_vis_mask.bool().to(self.device)
+        self.ent_txt_mask = ent_txt_mask.bool().to(self.device)
+
         false_ents = torch.full((self.num_ent,1),False, device=self.device)
-        self.ent_mask = torch.cat([false_ents, false_ents, ent_vis_mask, ent_txt_mask], dim = 1)
+        self.ent_mask = torch.cat([false_ents, false_ents, self.ent_vis_mask, self.ent_txt_mask], dim = 1)
         
         # print(self.ent_mask.shape)
         false_rels = torch.full((self.num_rel,1),False, device=self.device)
@@ -107,6 +111,34 @@ class TSAM(nn.Module):
         # 轻量文本增强：注意力池化 + Adapter（不改训练超参）
         self.txt_pool_proj = nn.Linear(dim_str, 1)
         self.txt_adapter = nn.Sequential(
+            nn.LayerNorm(dim_str),
+            nn.Linear(dim_str, max(32, dim_str // 4)),
+            nn.GELU(),
+            nn.Linear(max(32, dim_str // 4), dim_str),
+        )
+        # 视觉可学习回退（缺视觉时将结构映射为“视觉风格”）
+        self.vis_fallback = nn.Sequential(
+            nn.LayerNorm(dim_str),
+            nn.Linear(dim_str, max(32, dim_str // 4)),
+            nn.GELU(),
+            nn.Linear(max(32, dim_str // 4), dim_str),
+        )
+
+        # FERF-lite 重构器（仅语义：文本/视觉双向重构）
+        self.text_recon_mlp = nn.Sequential(
+            nn.LayerNorm(2 * dim_str),
+            nn.Linear(2 * dim_str, dim_str),
+            nn.GELU(),
+            nn.Linear(dim_str, dim_str),
+        )
+        self.vis_recon_mlp = nn.Sequential(
+            nn.LayerNorm(2 * dim_str),
+            nn.Linear(2 * dim_str, dim_str),
+            nn.GELU(),
+            nn.Linear(dim_str, dim_str),
+        )
+        # 缺文本时的可学习回退：将结构表示映射到“文本风格”后再回退
+        self.text_fallback = nn.Sequential(
             nn.LayerNorm(dim_str),
             nn.Linear(dim_str, max(32, dim_str // 4)),
             nn.GELU(),
@@ -213,13 +245,25 @@ class TSAM(nn.Module):
         ent_seq2 = torch.cat([ent_tkn, rep_ent_vis, ], dim = 1)
         ent_seq3 = torch.cat([ent_tkn,  rep_ent_txt], dim = 1)
         str_embdding = self.ent_encoder(ent_seq1)[:,0]
-        vis_embdding = self.ent_encoder(ent_seq2)[:,0]
-        # 文本通路：用可学习注意力池化替代取第0位，并串联轻量Adapter增强
-        txt_seq_enc = self.ent_encoder(ent_seq3)  # (num_ent, L, d)
+        # 视觉通路：加入 key mask，避免缺失/填充 token 参与注意力
+        vis_key_mask = torch.cat([
+            torch.zeros((self.num_ent, 1), dtype=torch.bool, device=self.device),
+            self.ent_vis_mask
+        ], dim=1)
+        vis_seq_enc = self.ent_encoder(ent_seq2, src_key_padding_mask=vis_key_mask)
+        vis_embdding = vis_seq_enc[:,0]
+        vis_m_raw = vis_embdding.clone()
+        # 文本通路：加入 key mask，避免缺失/填充 token 参与注意力；随后注意力池化 + 适配器增强
+        txt_key_mask = torch.cat([
+            torch.zeros((self.num_ent, 1), dtype=torch.bool, device=self.device),
+            self.ent_txt_mask
+        ], dim=1)  # (num_ent, 1+L_txt)
+        txt_seq_enc = self.ent_encoder(ent_seq3, src_key_padding_mask=txt_key_mask)  # (num_ent, L, d)
         txt_scores = self.txt_pool_proj(txt_seq_enc).squeeze(-1)  # (num_ent, L)
         txt_weights = torch.softmax(txt_scores, dim=1)
         txt_embdding = torch.sum(txt_weights.unsqueeze(-1) * txt_seq_enc, dim=1)  # (num_ent, d)
         txt_embdding = txt_embdding + self.txt_adapter(txt_embdding)
+        txt_m_raw = txt_embdding.clone()
         
         # 原始对比损失（SACL）
         clmodel = CLoss()
@@ -236,8 +280,8 @@ class TSAM(nn.Module):
             # ent_mask shape: (num_ent, 4) = [str_mask, str_mask, vis_mask, txt_mask]
             # ent_mask[:, 2] = vis_mask (True表示缺失，False表示存在)
             # ent_mask[:, 3] = txt_mask (True表示缺失，False表示存在)
-            vis_available = ~self.ent_mask[:, 2]  # (num_ent,) False表示缺失，True表示存在
-            txt_available = ~self.ent_mask[:, 3]  # (num_ent,) False表示缺失，True表示存在
+            vis_available = ~self.ent_vis_mask.any(dim=1)  # 任一视觉token可用即视为存在
+            txt_available = ~self.ent_txt_mask.any(dim=1)  # 任一文本token可用即视为存在
             
             # 语义分支（欧式拉近）
             t_sem, v_sem = self.semantic_head(e_t, e_v)
@@ -258,8 +302,8 @@ class TSAM(nn.Module):
             # 模态缺失处理：对于缺失的模态，使用结构表示作为fallback
             # 如果文本缺失，使用结构表示；如果视觉缺失，使用结构表示
             # 这里使用str_embdding作为fallback
-            t_fuse = torch.where(txt_available.unsqueeze(-1), t_fuse, str_embdding)
-            v_fuse = torch.where(vis_available.unsqueeze(-1), v_fuse, str_embdding)
+            t_fuse = torch.where(txt_available.unsqueeze(-1), t_fuse, self.text_fallback(str_embdding))
+            v_fuse = torch.where(vis_available.unsqueeze(-1), v_fuse, self.vis_fallback(str_embdding))
             
             # 使用融合后的表示替换原始表示
             txt_embdding = t_fuse
