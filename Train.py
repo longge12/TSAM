@@ -77,6 +77,8 @@ if __name__ == "__main__":
     parser.add_argument('--curvature_init', default=0.1, type=float)
     parser.add_argument('--use_diversity_reg', action='store_true')
     parser.add_argument('--diversity_margin', default=0.5, type=float)
+    # semantic-only FERF-lite reconstruction weight
+    parser.add_argument('--lambda_rec_sem', default=0.05, type=float)
     parser.add_argument('--gate_t_target', default=0.55, type=float)
     parser.add_argument('--gate_v_target', default=0.50, type=float)
     # front loss weights
@@ -301,6 +303,12 @@ if __name__ == "__main__":
                     difficulty_aware=False,
                 )
                 fuse_reg_loss = diversity_loss + args.lambda_f * gate_reg_loss_val
+                # 语义分支FERF-lite重构损失（仅文本/视觉）
+                try:
+                    recon_sem_loss = model.semantic_recon_loss()
+                except Exception:
+                    recon_sem_loss = torch.tensor(0.0, device=ent_embs.device)
+                fuse_reg_loss = fuse_reg_loss + args.lambda_rec_sem * recon_sem_loss
 
                 total_sem_loss += front_loss_dict['L_sem'].item()
                 total_ang_loss += front_loss_dict['L_ang'].item()

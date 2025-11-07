@@ -292,6 +292,14 @@ class TSAM(nn.Module):
             # 将双曲空间向量映射回切空间（欧式空间）
             t_hyp_tangent = self.hyperbolic_head.log_map(t_hyp, c_t)
             v_hyp_tangent = self.hyperbolic_head.log_map(v_hyp, c_v)
+
+            # 缓存语义分支与可用性（用于训练期FERF-lite重构损失）
+            self._txt_m_raw = txt_m_raw
+            self._vis_m_raw = vis_m_raw
+            self._t_sem = t_sem
+            self._v_sem = v_sem
+            self._txt_available = txt_available
+            self._vis_available = vis_available
             
             # 门控融合
             t_fuse, v_fuse, gate_info = self.fusion(
@@ -369,3 +377,40 @@ class TSAM(nn.Module):
             
 
         return scores
+
+    def semantic_recon_loss(self) -> torch.Tensor:
+        """FERF-lite：仅在语义分支上进行文本/视觉双向重构损失。
+        需要在 forward 后调用（使用在 forward 中缓存的张量）。
+        """
+        if not hasattr(self, '_txt_m_raw'):
+            return torch.tensor(0.0, device=self.device)
+        txt_avail = self._txt_available if hasattr(self, '_txt_available') else None
+        vis_avail = self._vis_available if hasattr(self, '_vis_available') else None
+
+        loss = torch.tensor(0.0, device=self.device)
+        count = 0
+        # 文本重构：M_t_hat = g_t([M_v, T_t]) -> M_t
+        if txt_avail is not None and vis_avail is not None:
+            mask_t = (txt_avail & vis_avail)
+            if mask_t.any():
+                mt = self._txt_m_raw[mask_t]
+                mv = self._vis_m_raw[mask_t]
+                tt = self._t_sem[mask_t]
+                inp_t = torch.cat([mv, tt], dim=-1)
+                mt_hat = self.text_recon_mlp(inp_t)
+                loss = loss + torch.mean((mt_hat - mt) ** 2)
+                count += 1
+        # 视觉重构：M_v_hat = g_v([M_t, T_v]) -> M_v
+        if txt_avail is not None and vis_avail is not None:
+            mask_v = (txt_avail & vis_avail)
+            if mask_v.any():
+                mv = self._vis_m_raw[mask_v]
+                mt = self._txt_m_raw[mask_v]
+                tv = self._v_sem[mask_v]
+                inp_v = torch.cat([mt, tv], dim=-1)
+                mv_hat = self.vis_recon_mlp(inp_v)
+                loss = loss + torch.mean((mv_hat - mv) ** 2)
+                count += 1
+        if count == 0:
+            return torch.tensor(0.0, device=self.device)
+        return loss / count
