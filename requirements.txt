@@ -1,0 +1,5 @@
+python>=3.9
+torch>=2.0
+transformers
+scipy
+tqdm
